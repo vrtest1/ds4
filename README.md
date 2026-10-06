@@ -2,6 +2,20 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **Experimental Vision history fork** — This `vrtest1/ds4` branch adds an
+> opt-in policy that keeps the most recent 16 images in Vision input and
+> replaces older image markers with a note, so image-heavy conversations can
+> continue. It is based on upstream PR [#1022](https://github.com/antirez/ds4/pull/1022).
+> Enable it when starting the server with `DS4_VISION_KEEP_IMAGES=16`.
+> GPU and real-model Vision inference have not yet been validated by the fork
+> maintainer. See [docs/VISION_WINDOW_FORK.md](docs/VISION_WINDOW_FORK.md) for
+> setup, behavior, limitations, and the benchmark procedure.
+>
+> Clone this branch with:
+> ```sh
+> git clone --branch experimental/vision-drop-oldest-16 https://github.com/vrtest1/ds4.git
+> ```
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
