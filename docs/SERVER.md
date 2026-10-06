@@ -101,10 +101,17 @@ base64 image sources. Remote URLs and server-side file paths are rejected.
 Image blocks preserve their order in the request. The limit is 16 images and
 a 64 MiB HTTP body. Requests over that limit fail by default; agent loops
 that accumulate a screenshot per tool round can instead set the environment
-variable `DS4_VISION_KEEP_IMAGES=N` (1 <= N <= 1024) to opt into
+variable `DS4_VISION_KEEP_IMAGES=N` (1 <= N <= 16 in this experimental fork) to opt into
 auto-reduction: the server keeps the last N images of the history and serves
 the request, replacing each dropped image sentinel in the transcript with a
 fixed text note.
+
+For the experimental build and validation limits, see
+[VISION_WINDOW_FORK.md](VISION_WINDOW_FORK.md). The total submitted history is
+still limited to 1024 images when reduction is enabled, and the 64 MiB HTTP
+body limit applies before reduction. Unset or invalid settings retain the
+default rejection policy. Image removal invalidates live KV reuse; retained
+image embeddings may still be cached. Vision KV is not persisted to disk.
 
 ## Disk KV cache
 

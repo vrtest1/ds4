@@ -3646,7 +3646,7 @@ static void server_log(ds4_log_type type, const char *fmt, ...);
 /* Vision image budget.  Dropping older images is an intentionally lossy
  * policy, so it is opt-in: by default requests with more than
  * DS4_VISION_REJECT_LIMIT images are rejected.  Setting the environment
- * variable DS4_VISION_KEEP_IMAGES=N (0 < N <= DS4_VISION_HARD_LIMIT) enables
+ * variable DS4_VISION_KEEP_IMAGES=N (0 < N <= DS4_VISION_REJECT_LIMIT) enables
  * auto-reduction instead: the OLDEST images are dropped (the freshest views
  * matter most to agent loops) and each dropped image sentinel in the rendered
  * transcript is replaced by a fixed text note, so the model still sees an
@@ -3660,18 +3660,27 @@ static void server_log(ds4_log_type type, const char *fmt, ...);
 static size_t ds4_vision_keep_cached;   /* 0 = auto-reduce disabled */
 static pthread_once_t ds4_vision_keep_once = PTHREAD_ONCE_INIT;
 
+/* This experimental fork retains the upstream 16-entry live replay structures.
+ * Keep larger windows disabled until those structures are made dynamic. */
+static size_t ds4_vision_parse_keep_images(const char *env) {
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(env, &end, 10);
+    if (errno || end == env || *end || v < 1 || v > DS4_VISION_REJECT_LIMIT)
+        return 0;
+    return (size_t)v;
+}
+
 static void ds4_vision_keep_images_init(void) {
     const char *env = getenv("DS4_VISION_KEEP_IMAGES");
     if (!env || !env[0]) return;
-    char *end = NULL;
-    long v = strtol(env, &end, 10);
-    if (*end == '\0' && v >= 1 && v <= DS4_VISION_HARD_LIMIT) {
-        ds4_vision_keep_cached = (size_t)v;
-    } else {
+    ds4_vision_keep_cached = ds4_vision_parse_keep_images(env);
+    if (!ds4_vision_keep_cached) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: ignoring invalid DS4_VISION_KEEP_IMAGES='%s' "
                    "(valid range 1..%d); auto-reduce stays disabled",
-                   env, DS4_VISION_HARD_LIMIT);
+                   env, DS4_VISION_REJECT_LIMIT);
     }
 }
 
@@ -3725,8 +3734,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         if (count > DS4_VISION_REJECT_LIMIT) {
             snprintf(err, errlen,
                      "too many images; at most %d are allowed "
-                     "(set DS4_VISION_KEEP_IMAGES=N to serve the request "
-                     "with the oldest images dropped instead)",
+                     "(set DS4_VISION_KEEP_IMAGES=16 to omit older images)",
                      DS4_VISION_REJECT_LIMIT);
             return false;
         }
@@ -22440,6 +22448,79 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
+static void test_vision_window_boundaries(void) {
+    TEST_ASSERT(ds4_vision_parse_keep_images(NULL) == 0);
+    TEST_ASSERT(ds4_vision_parse_keep_images("") == 0);
+    TEST_ASSERT(ds4_vision_parse_keep_images("1") == 1);
+    TEST_ASSERT(ds4_vision_parse_keep_images("16") == 16);
+    const char *invalid[] = {"0", "-1", "17", "32", "1024", "16x",
+                             "999999999999999999999999999999999"};
+    for (size_t i = 0; i < sizeof(invalid)/sizeof(invalid[0]); i++)
+        TEST_ASSERT(ds4_vision_parse_keep_images(invalid[i]) == 0);
+
+    server_image_input imgs[24] = {0};
+    server_image_input *inputs[24];
+    for (int i = 0; i < 24; i++) {
+        snprintf(imgs[i].marker, sizeof(imgs[i].marker),
+                 "\036DS4_IMAGE_%024d\037", i);
+        inputs[i] = &imgs[i];
+    }
+    const int counts[] = {1, 15, 16, 17, 18, 24};
+    for (size_t c = 0; c < sizeof(counts)/sizeof(counts[0]); c++) {
+        int count = counts[c];
+        int dropped = count > 16 ? count - 16 : 0;
+        buf original = {0}, expected = {0};
+        for (int i = 0; i < count; i++) {
+            buf_printf(&original, "user-%d:", i);
+            buf_printf(&expected, "user-%d:", i);
+            buf_puts(&original, imgs[i].marker);
+            buf_puts(&expected, i < dropped ? DS4_VISION_OMIT_NOTE : imgs[i].marker);
+            buf_printf(&original, "assistant-%d;tool-result-%d;", i, i);
+            buf_printf(&expected, "assistant-%d;tool-result-%d;", i, i);
+        }
+        buf_puts(&original, "user:text-only follow-up");
+        buf_puts(&expected, "user:text-only follow-up");
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.prompt_text = buf_take(&original);
+        char *replay = xstrdup(r.prompt_text);
+        TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, inputs, count, dropped));
+        TEST_ASSERT(!strcmp(r.prompt_text, expected.ptr));
+        char *reduced = xstrdup(r.prompt_text);
+        free(r.prompt_text);
+        r.prompt_text = replay;
+        TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, inputs, count, dropped));
+        TEST_ASSERT(!strcmp(r.prompt_text, reduced));
+        free(reduced);
+        request_free(&r);
+        buf_free(&expected);
+    }
+
+    /* A sliding image set cannot reuse KV, even if placeholder tokens match.
+     * After rebuilding the checkpoint, an unchanged set can reuse it again. */
+    int tokens[40];
+    for (int i = 0; i < 40; i++) tokens[i] = i + 1;
+    ds4_vision_span old[16] = {0}, next[16] = {0};
+    for (int i = 0; i < 16; i++) {
+        old[i].token_start = next[i].token_start = (uint32_t)(i * 2);
+        old[i].embedding.token_count = next[i].embedding.token_count = 1;
+        old[i].embedding.fingerprint[0] = (uint8_t)(i + 1);
+        next[i].embedding.fingerprint[0] = (uint8_t)(i + 2);
+    }
+    server s = {0};
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(tokens, 40);
+    ds4_session_set_test_images(slot.session, old, 16);
+    request req = {.images = next, .image_count = 16};
+    for (int i = 0; i < 40; i++) ds4_tokens_push(&req.prompt, tokens[i]);
+    ds4_tokens_push(&req.prompt, 41);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind == REUSE_NONE);
+    ds4_session_set_test_images(slot.session, next, 16);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind == REUSE_MEMORY_TOKEN);
+    ds4_tokens_free(&req.prompt);
+    ds4_session_free_test_checkpoint(slot.session);
+}
+
 static void test_prompt_text_drop_oldest_images(void) {
     server_image_input imgs[3];
     memset(imgs, 0, sizeof(imgs));
@@ -22491,6 +22572,7 @@ static void test_prompt_text_drop_oldest_images(void) {
     free(r.prompt_text);
     r.prompt_text = xstrdup("nothing here");
     TEST_ASSERT(!ds4_prompt_text_drop_oldest_images(&r, one, 1, 1));
+    TEST_ASSERT(!strcmp(r.prompt_text, "nothing here"));
 
     free(r.prompt_text);
     r.prompt_text = NULL;
@@ -23193,6 +23275,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_prompt_text_drop_oldest_images();
+    test_vision_window_boundaries();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
